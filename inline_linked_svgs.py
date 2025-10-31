@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Recursively inlines linked SVG files (including nested ones), converts all to Plain SVG,
-and exports to PDF using Inkscape. Fixes text misalignment.
+Recursively inlines linked SVG files (including nested ones), optionally replaces fonts,
+converts to Plain SVG, and exports to PDF using Inkscape.
 """
 
 import argparse
@@ -66,7 +66,7 @@ def convert_to_plain_svg(svg_path: Path) -> Path:
             str(svg_path),
             "--export-plain-svg",
             f"--export-filename={str(plain_svg_path)}",
-            "--vacuum-defs",  # ← 新增：精简 defs，减少冗余
+            "--vacuum-defs",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -92,6 +92,39 @@ def ensure_defs_parent(root: etree.Element) -> etree.Element:
     return defs
 
 
+# ✅ 修改：通用字体替换函数
+def replace_fonts(root: etree.Element, font_name: str) -> None:
+    """
+    Replace all font-family styles with the specified font.
+    If font_name is None or empty, do nothing.
+    """
+    if not font_name:
+        return
+
+    logger.info(f"Replacing all text fonts with '{font_name}'...")
+    for elem in root.xpath(".//svg:text | .//svg:tspan", namespaces=NSMAP):
+        style = elem.get("style")
+        if style is not None:
+            parts = [part.strip() for part in style.split(";") if part.strip()]
+            new_parts = []
+            found_font = False
+            for part in parts:
+                if part.lower().startswith("font-family"):
+                    new_parts.append(f"font-family:{font_name}")
+                    found_font = True
+                else:
+                    new_parts.append(part)
+            if not found_font:
+                new_parts.append(f"font-family:{font_name}")
+            elem.set("style", "; ".join(new_parts) + ";")
+        else:
+            elem.set("style", f"font-family:{font_name};")
+
+        # Remove direct font-family attribute if present
+        if "font-family" in elem.attrib:
+            del elem.attrib["font-family"]
+
+
 def process_svg_tree_recursive(
     root: etree.Element,
     base_dir: Path,
@@ -99,6 +132,7 @@ def process_svg_tree_recursive(
     main_defs: etree.Element,
     depth: int = 0,
     max_depth: int = 10,
+    font_to_replace: str = None,  # ✅ 新增参数
 ) -> None:
     """Recursively inline linked SVGs after converting them to Plain SVG."""
     if depth > max_depth:
@@ -110,7 +144,17 @@ def process_svg_tree_recursive(
 
     for image in list(images):
         href = image.attrib.get(href_attr)
-        if not href or not href.lower().endswith(".svg"):
+        if not href:
+            continue
+
+        # ✅ 跳过 data: URI
+        if href.startswith("data:"):
+            logger.debug(f"Skipping embedded data:image: {href[:50]}...")
+            continue
+
+        # ✅ 只处理 .svg 文件
+        if not href.lower().endswith(".svg"):
+            logger.debug(f"Skipping non-SVG image: {href}")
             continue
 
         try:
@@ -122,17 +166,20 @@ def process_svg_tree_recursive(
 
             logger.info(f"{'  ' * depth}Processing: {linked_path.name} (depth {depth})")
 
-            # ✅ Step 1: Convert to Plain SVG first
+            # Step 1: Convert to Plain SVG
             plain_linked_path = convert_to_plain_svg(linked_path)
 
-            # ✅ Step 2: Parse the Plain SVG
+            # Step 2: Parse the Plain SVG
             sub_tree = etree.parse(str(plain_linked_path), parser)
             sub_root = sub_tree.getroot()
 
-            # Recursively inline nested SVGs inside this one
+            # Recursively inline nested SVGs
             process_svg_tree_recursive(
-                sub_root, plain_linked_path.parent, parser, main_defs, depth + 1, max_depth
+                sub_root, plain_linked_path.parent, parser, main_defs, depth + 1, max_depth, font_to_replace
             )
+
+            # ✅ Apply font replacement if requested
+            replace_fonts(sub_root, font_to_replace)
 
             # Parse viewBox
             viewBox = sub_root.attrib.get("viewBox")
@@ -186,7 +233,7 @@ def process_svg_tree_recursive(
             # Replace <image> with <g>
             image.getparent().replace(image, wrapper)
 
-            # ✅ Clean up temporary plain SVG
+            # Clean up temporary plain SVG
             plain_linked_path.unlink(missing_ok=True)
             logger.info(f"Removed temporary plain SVG: {plain_linked_path}")
 
@@ -195,12 +242,12 @@ def process_svg_tree_recursive(
             continue
 
 
-def inline_linked_vectors(svg_path: Path) -> Path:
+def inline_linked_vectors(svg_path: Path, font_to_replace: str = None) -> Path:
     """Convert main SVG to Plain SVG, then recursively inline all linked SVGs."""
     logger.info("Converting main SVG to Plain SVG...")
     plain_main_path = convert_to_plain_svg(svg_path)
 
-    parser = etree.XMLParser(remove_blank_text=True, strip_cdata=False)
+    parser = etree.XMLParser(remove_blank_text=True, strip_cdata=False, huge_tree=True)
     tree = etree.parse(str(plain_main_path), parser)
     root = tree.getroot()
 
@@ -213,6 +260,15 @@ def inline_linked_vectors(svg_path: Path) -> Path:
         href = image.attrib.get(href_attr)
         if not href:
             continue
+
+        if href.startswith("data:"):
+            logger.debug(f"Skipping embedded data:image: {href[:50]}...")
+            continue
+
+        if not href.lower().endswith(".svg"):
+            logger.debug(f"Skipping non-SVG image: {href}")
+            continue
+
         try:
             new_href = make_absolute_href(href, svg_path.parent)
             resolved_path = extract_path_from_href(new_href)
@@ -226,7 +282,10 @@ def inline_linked_vectors(svg_path: Path) -> Path:
 
     # Recursively inline all SVGs
     logger.info("Starting recursive inlining of nested SVGs...")
-    process_svg_tree_recursive(root, plain_main_path.parent, parser, main_defs, depth=0)
+    process_svg_tree_recursive(root, plain_main_path.parent, parser, main_defs, depth=0, font_to_replace=font_to_replace)
+
+    # ✅ Apply font replacement to final SVG if requested
+    replace_fonts(root, font_to_replace)
 
     # Write inlined SVG
     temp_output = svg_path.with_name(f"temp_inlined_{svg_path.name}")
@@ -248,7 +307,6 @@ def inline_linked_vectors(svg_path: Path) -> Path:
 def export_to_pdf(svg_path: Path, pdf_path: Path, text_to_path: bool = False):
     """
     Export SVG to PDF using Inkscape.
-    No --pdf-fonts (as requested).
     """
     logger.info(f"Exporting to PDF with Inkscape (text-to-path={text_to_path})...")
     cmd = [
@@ -269,13 +327,16 @@ def export_to_pdf(svg_path: Path, pdf_path: Path, text_to_path: bool = False):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Inline linked SVGs (after converting all to Plain SVG) and export to PDF."
+        description="Inline linked SVGs, optionally replace fonts, and export to PDF."
     )
     parser.add_argument("input_svg", type=Path, help="Input SVG file")
     parser.add_argument("output_pdf", type=Path, help="Output PDF file")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary inlined SVG")
-    parser.add_argument("--text-to-path", action="store_true", help="Convert text to paths")
+    parser.add_argument("--text-to-path", action="store_true", help="Convert text to paths (recommended for font safety)")
+    # ✅ 新增：字体替换参数
+    parser.add_argument("--font", type=str, default=None, help="Replace all fonts with specified font (e.g., Arial, 'Times New Roman'). No replacement if not set.")
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -290,8 +351,8 @@ def main():
 
     logger.info(f"Processing: {input_svg}")
 
-    # Step 1: Convert and inline all SVGs
-    inlined_svg_path = inline_linked_vectors(input_svg)
+    # Step 1: Convert and inline all SVGs, optionally replace fonts
+    inlined_svg_path = inline_linked_vectors(input_svg, font_to_replace=args.font)
 
     # Step 2: Export to PDF
     try:
@@ -303,4 +364,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
